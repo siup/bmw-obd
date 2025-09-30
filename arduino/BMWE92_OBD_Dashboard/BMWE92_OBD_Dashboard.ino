@@ -33,6 +33,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
+#include <FS.h>
+#include <SD.h>
 
 // ===== Konfiguracja użytkownika =====
 // Nazwa/parowanie ELM327 (SPP)
@@ -59,9 +61,14 @@
 #define TOUCH_IRQ 27 // ustaw -1 gdy nie używasz pinu przerwania
 #endif
 
+#ifndef SD_CS
+#define SD_CS 13
+#endif
+
 // Częstotliwości SPI
 constexpr uint32_t SPI_FREQ_TFT = 40'000'000; // 40 MHz
 constexpr uint32_t SPI_FREQ_TOUCH = 2'000'000; // 2 MHz
+constexpr uint32_t LOG_INTERVAL_MS = 1000;      // zapisuj log co 1 s
 
 // Interwały odświeżania
 constexpr uint32_t POLL_FAST_MS = 200; // szybkie PID-y (RPM, prędkość)
@@ -71,6 +78,10 @@ constexpr uint32_t POLL_SLOW_MS = 800; // wolniejsze PID-y (temp itd.)
 BluetoothSerial SerialBT;
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
+File logFile;
+
+bool sdReady = false;
+uint32_t tLog = 0;
 
 // Stan GUI
 enum Page : uint8_t { PAGE_MAIN = 0, PAGE_EXTRA = 1 };
@@ -196,6 +207,61 @@ void drawAll() {
   } else {
     drawExtraPage();
   }
+}
+
+String nextLogFilename() {
+  for (uint16_t i = 0; i < 1000; ++i) {
+    String name = "/obd_" + String(i) + ".csv";
+    if (!SD.exists(name)) {
+      return name;
+    }
+  }
+  return F("/obd.csv");
+}
+
+void initSdCard() {
+  if (!SD.begin(SD_CS)) {
+    Serial.println(F("[SD] Nie udalo sie zainicjowac karty SD."));
+    return;
+  }
+
+  String filename = nextLogFilename();
+  logFile = SD.open(filename, FILE_WRITE);
+  if (!logFile) {
+    Serial.println(F("[SD] Nie moge otworzyc pliku logu."));
+    return;
+  }
+
+  logFile.println(F("timestamp_ms,rpm,speed,coolant,iat,throttle,fuelLevel,load,map,maf"));
+  logFile.flush();
+  sdReady = true;
+  Serial.print(F("[SD] Logowanie do pliku: "));
+  Serial.println(filename);
+}
+
+void logObdData(uint32_t timestamp) {
+  if (!sdReady || !logFile) return;
+
+  logFile.print(timestamp);
+  logFile.print(',');
+  logFile.print(obd.rpm);
+  logFile.print(',');
+  logFile.print(obd.speed);
+  logFile.print(',');
+  logFile.print(obd.coolant);
+  logFile.print(',');
+  logFile.print(obd.iat);
+  logFile.print(',');
+  logFile.print(obd.throttle);
+  logFile.print(',');
+  logFile.print(obd.fuelLevel);
+  logFile.print(',');
+  logFile.print(obd.load);
+  logFile.print(',');
+  logFile.print(obd.map);
+  logFile.print(',');
+  logFile.println(obd.maf);
+  logFile.flush();
 }
 
 // ===== Obsługa ELM327 =====
@@ -351,6 +417,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  initSdCard();
+
   tft.begin(SPI_FREQ_TFT);
   tft.setRotation(1);
   tft.fillScreen(ILI9341_BLACK);
@@ -375,6 +443,15 @@ void setup() {
     tft.print("Polaczono.");
   }
 
+  tft.setCursor(10, 100);
+  if (sdReady) {
+    tft.setTextColor(ILI9341_CYAN);
+    tft.print("SD logging OK");
+  } else {
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.print("Brak logow SD");
+  }
+
   delay(500);
   drawAll();
 }
@@ -396,6 +473,11 @@ void loop() {
     if (currentPage == PAGE_EXTRA) {
       drawExtraPage();
     }
+  }
+
+  if (sdReady && SerialBT.connected() && now - tLog >= LOG_INTERVAL_MS) {
+    tLog = now;
+    logObdData(now);
   }
 
   if (ts.touched()) {
