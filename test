@@ -1,0 +1,423 @@
+/*
+  ESP32 OBD-II Dashboard dla BMW E92 328i (N52)  
+  — ELM327 (Bluetooth SPP) + TFT 3.2" (ILI9341 320x240) + dotyk XPT2046
+
+  Funkcje:
+  - Łączenie z ELM327 przez Bluetooth Classic SPP
+  - Inicjalizacja ELM: ATZ, ATE0, ATL0, ATS0, ATH1 (ramki), ATSP0 (auto)
+  - Odczyt podstawowych PID OBD-II (Mode 01): obroty, prędkość, temp. cieczy, throttle, IAT, MAP/MAF (opcjonalnie), poziom paliwa, load
+  - Prosta wizualizacja na TFT (siatka kafelków + przycisk odświeżania)
+  - Obsługa dotyku (XPT2046) do przełączania ekranu (podstawowy / dodatki)
+
+  Uwaga:
+  - ELM327 daje dostęp głównie do standardowych PID-ów. Dane specyficzne BMW (np. temp. oleju, kąt VANOS, ciśnienie paliwa high-pressure, itp.) wymagają PID-ów rozszerzonych/manuf., których kody nie są publiczne. Można je dodać, jeśli masz ich definicje (Mode 22 + identyfikator). Zostawiłem hook w kodzie.
+  - BMW E92 (EU/US) komunikuje się po CAN (11-bit 500 kbps) — ATSP6. ATSP0 (auto) zwykle wystarczy; jeśli nie, ustaw ATSP6.
+
+  Sprzęt (przykład):
+  - ESP32-WROOM/ESP32-S3 (Arduino Core)
+  - TFT ILI9341 320x240 SPI
+  - Panel dotykowy XPT2046 (SPI) — CS osobny
+  - Zasilanie z 12 V -> przetwornica buck 5 V / 2 A -> ESP32 + TFT
+
+  Biblioteki (Arduino IDE -> Library Manager):
+  - Adafruit GFX Library
+  - Adafruit ILI9341
+  - XPT2046_Touchscreen (Paul Stoffregen)
+  - BluetoothSerial (w zestawie z ESP32 core)
+
+  Autor: przygotowane pod potrzeby użytkownika (2025-09-30)
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <BluetoothSerial.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <XPT2046_Touchscreen.h>
+
+// ====== KONFIGURACJA UŻYTKOWNIKA ======
+// Nazwa/parowanie ELM327 (SPP). Często "OBDII", "ELM327", "V-LINK" itp.
+#define ELM_BT_NAME "OBDII"   // jeśli Twój ELM ma inną nazwę, zmień tutaj
+
+// Ustawienia TFT (SPI)
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4  // lub -1 jeśli podciągnięty do resetu ESP32
+
+// Ustawienia dotyku XPT2046 (współdzieli SPI z TFT)
+#define TOUCH_CS   15
+#define TOUCH_IRQ  27  // opcjonalnie; jeśli brak podłączonego IRQ, ustaw na -1 i zmień kod
+
+// Piny SPI (jeśli używasz HSPI zamiast VSPI) — odkomentuj w razie potrzeby
+// #define SPI_SCLK 18
+// #define SPI_MISO 19
+// #define SPI_MOSI 23
+
+// Częstotliwości SPI
+const uint32_t SPI_FREQ_TFT = 40000000; // 40 MHz — ILI9341 często działa stabilnie
+const uint32_t SPI_FREQ_TOUCH = 2000000; // 2 MHz dla XPT2046
+
+// Interwały odświeżania
+const uint32_t POLL_FAST_MS = 200;   // szybkie PID-y (RPM, prędkość)
+const uint32_t POLL_SLOW_MS = 800;   // wolniejsze PID-y (temp itd.)
+
+// ====== OBIEKTY GLOBALNE ======
+BluetoothSerial SerialBT;
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
+
+// Stan GUI
+enum Page { PAGE_MAIN = 0, PAGE_EXTRA = 1 };
+Page currentPage = PAGE_MAIN;
+
+// Bufory
+String elmBuffer;
+
+// Dane PID
+struct ObdData {
+  int rpm = -1;       // 010C
+  int speed = -1;     // 010D (km/h)
+  int coolant = -128; // 0105 (°C)
+  int iat = -128;     // 010F (°C)
+  int throttle = -1;  // 0111 (%)
+  int fuelLevel = -1; // 012F (%)
+  int load = -1;      // 0104 (%)
+  int map = -1;       // 010B (kPa)
+  int maf = -1;       // 0110 (g/s)
+} obd;
+
+// Timery
+uint32_t tFast = 0;
+uint32_t tSlow = 0;
+
+// ====== POMOCNICZE ======
+void tftHeader(const char* title) {
+  tft.fillRect(0, 0, tft.width(), 26, ILI9341_NAVY);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(8, 4);
+  tft.print(title);
+}
+
+void drawTile(int x, int y, int w, int h, const __FlashStringHelper* label, const String& value) {
+  tft.drawRect(x, y, w, h, ILI9341_DARKGREY);
+  tft.setTextColor(ILI9341_LIGHTGREY);
+  tft.setTextSize(2);
+  tft.setCursor(x + 8, y + 6);
+  tft.print(label);
+
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(x + 8, y + 34);
+  tft.print(value);
+}
+
+String dashVal(int v, const char* unit = "") { 
+  if (v < 0) return F("—"); 
+  return String(v) + unit; 
+}
+String dashTemp(int v) {
+  if (v <= -100) return F("—");
+  return String(v) + F(" °C");
+}
+
+void drawMainPage() {
+  tft.fillScreen(ILI9341_BLACK);
+  tftHeader("BMW E92 — OBD (MAIN)");
+  // 2 kolumny x 3 rzędy kafelków
+  int w = 150, h = 70, gap = 10;
+  int x1 = 10, x2 = 160;
+  int y1 = 36, y2 = y1 + h + gap, y3 = y2 + h + gap;
+
+  drawTile(x1, y1, w, h, F("RPM"), obd.rpm < 0 ? F("—") : String(obd.rpm));
+  drawTile(x2, y1, w, h, F("Speed"), dashVal(obd.speed, " km/h"));
+
+  drawTile(x1, y2, w, h, F("Coolant"), dashTemp(obd.coolant));
+  drawTile(x2, y2, w, h, F("Throttle"), obd.throttle < 0 ? F("—") : String(obd.throttle) + "%");
+
+  drawTile(x1, y3, w, h, F("IAT"), dashTemp(obd.iat));
+  drawTile(x2, y3, w, h, F("Fuel"), obd.fuelLevel < 0 ? F("—") : String(obd.fuelLevel) + "%");
+
+  // Przycisk PAGE
+  tft.fillRoundRect(10, 220, 90, 20, 6, ILI9341_DARKGREY);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(16, 222);
+  tft.print("EXTRA");
+}
+
+void drawExtraPage() {
+  tft.fillScreen(ILI9341_BLACK);
+  tftHeader("BMW E92 — OBD (EXTRA)");
+
+  int w = 220, h = 50;
+  drawTile(10, 40, w, h, F("Engine Load"), obd.load < 0 ? F("—") : String(obd.load) + "%");
+  drawTile(10, 100, w, h, F("MAP"), obd.map < 0 ? F("—") : String(obd.map) + " kPa");
+  drawTile(10, 160, w, h, F("MAF"), obd.maf < 0 ? F("—") : String(obd.maf) + " g/s");
+
+  // Przycisk powrotu
+  tft.fillRoundRect(10, 220, 110, 20, 6, ILI9341_DARKGREY);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(16, 222);
+  tft.print("MAIN");
+}
+
+bool touchHit(int x, int y, int w, int h) {
+  if (!ts.touched()) return false;
+  TS_Point p = ts.getPoint();
+  // Uwaga: XPT2046 daje surowe współrzędne. Tu prosta normalizacja dla 320x240.
+  // Może wymagać kalibracji w Twoim zestawie (zmień zakresy min/max).
+  const int16_t RAW_MIN_X = 200, RAW_MAX_X = 3900;
+  const int16_t RAW_MIN_Y = 200, RAW_MAX_Y = 3900;
+  int16_t px = map(p.x, RAW_MIN_X, RAW_MAX_X, 0, tft.width());
+  int16_t py = map(p.y, RAW_MIN_Y, RAW_MAX_Y, 0, tft.height());
+  return (px >= x && px <= x + w && py >= y && py <= y + h);
+}
+
+// ====== OBD/ELM ======
+
+bool elmWrite(const String& cmd) {
+  if (!SerialBT.hasClient()) return false;
+  SerialBT.print(cmd);
+  SerialBT.print("\r");
+  return true;
+}
+
+// Czytanie do \n lub ">" z timeoutem
+bool elmReadLine(String& line, uint32_t timeoutMs = 500) {
+  uint32_t t0 = millis();
+  line = "";
+  while (millis() - t0 < timeoutMs) {
+    while (SerialBT.available()) {
+      char c = (char)SerialBT.read();
+      if (c == '\r') continue; // ignoruj CR
+      if (c == '\n') {
+        if (line.length()) return true; // zakończ linię
+        else continue;
+      }
+      if (c == '>') {
+        if (line.length()) return true; // prompt po danych
+        else continue;
+      }
+      line += c;
+    }
+    delay(2);
+  }
+  return line.length();
+}
+
+// Parsowanie odpowiedzi "41 XX ..."
+// Zwraca true, jeśli PID w odpowiedzi zgadza się z oczekiwanym.
+bool parseOBD_41(const String& line, uint8_t pidExpected, uint8_t& A, uint8_t& B) {
+  // Usuń spacje
+  String s;
+  s.reserve(line.length());
+  for (char c : line) if (c != ' ') s += (char)toupper(c);
+
+  // Szukamy nagłówka 41XX
+  if (s.length() < 4) return false;
+  if (s.substring(0, 2) != "41") return false;
+
+  // PID na pozycjach 2-4 (hex)
+  char pidStr[3] = { s[2], s[3], '\0' };
+  uint8_t pid = (uint8_t) strtoul(pidStr, nullptr, 16);
+  if (pid != pidExpected) return false;
+
+  // Dane zaczynają się od następnych bajtów (A, B, ...)
+  // Oczekujemy co najmniej 4 znaki na A i 4 na B (2 hexy = 1 bajt)
+  if (s.length() < 6) return false;
+  if (s.length() >= 6) {
+    char aStr[3] = { s[4], s[5], '\0' };
+    A = (uint8_t) strtoul(aStr, nullptr, 16);
+  }
+  if (s.length() >= 8) {
+    char bStr[3] = { s[6], s[7], '\0' };
+    B = (uint8_t) strtoul(bStr, nullptr, 16);
+  } else {
+    B = 0;
+  }
+  return true;
+}
+
+// Wysyła zapytanie o PID i czeka na linię z odpowiedzią
+bool requestPID(uint8_t pid, uint8_t& A, uint8_t& B) {
+  String cmd = "01" + String(pid, HEX);
+  cmd.toUpperCase();
+  elmWrite(cmd);
+
+  // ELM może zwrócić kilka linii (nagłówki). Zbieramy do skutku.
+  String line;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 700) {
+    if (elmReadLine(line, 300)) {
+      if (line.indexOf("NO DATA") >= 0) return false;
+      if (line.indexOf("STOPPED") >= 0) return false;
+      if (line.indexOf("ERROR") >= 0) return false;
+      uint8_t a=0,b=0;
+      if (parseOBD_41(line, pid, a, b)) { A=a; B=b; return true; }
+    }
+  }
+  return false;
+}
+
+// Konwersje PID
+void updateFastPIDs() {
+  uint8_t A, B;
+  // 010C RPM = ((A*256)+B)/4
+  if (requestPID(0x0C, A, B)) {
+    obd.rpm = ((A * 256) + B) / 4;
+  }
+  // 010D speed km/h = A
+  if (requestPID(0x0D, A, B)) {
+    obd.speed = A;
+  }
+}
+
+void updateSlowPIDs() {
+  uint8_t A, B;
+  // 0105 coolant temp = A - 40
+  if (requestPID(0x05, A, B)) obd.coolant = (int)A - 40;
+  // 010F intake air temp = A - 40
+  if (requestPID(0x0F, A, B)) obd.iat = (int)A - 40;
+  // 0111 throttle position = A * 100 / 255
+  if (requestPID(0x11, A, B)) obd.throttle = (int)((A * 100UL) / 255UL);
+  // 012F fuel level = A * 100 / 255
+  if (requestPID(0x2F, A, B)) obd.fuelLevel = (int)((A * 100UL) / 255UL);
+  // 0104 engine load = A * 100 / 255
+  if (requestPID(0x04, A, B)) obd.load = (int)((A * 100UL) / 255UL);
+  // 010B MAP = A (kPa)
+  if (requestPID(0x0B, A, B)) obd.map = A;
+  // 0110 MAF = ((256*A)+B)/100  (g/s)
+  if (requestPID(0x10, A, B)) obd.maf = (int)(((256UL * A) + B) / 100UL);
+}
+
+bool elmInit() {
+  // Najpierw spróbuj podłączyć do zapamiętanego/znalezionego urządzenia po nazwie
+  SerialBT.begin("ESP32-OBD");
+  delay(300);
+  if (!SerialBT.connect(ELM_BT_NAME)) {
+    // Jeśli nie łączy od razu, spróbuj w pętli przez krótki czas
+    uint32_t t0 = millis();
+    while (!SerialBT.connected() && millis() - t0 < 8000) {
+      SerialBT.connect(ELM_BT_NAME);
+      delay(500);
+    }
+  }
+  if (!SerialBT.connected()) return false;
+
+  auto sendAT = [&](const char* at, uint32_t waitMs = 300) {
+    elmWrite(at);
+    String line;
+    uint32_t t0 = millis();
+    while (millis() - t0 < waitMs) {
+      if (elmReadLine(line, waitMs)) {
+        // Możesz wypisać do Serial w trybie debug
+      }
+    }
+  };
+
+  sendAT("ATZ", 800);   // reset ELM
+  sendAT("ATE0", 200);  // echo off
+  sendAT("ATL0", 200);  // linefeeds off
+  sendAT("ATS0", 200);  // printing spaces off
+  sendAT("ATH1", 200);  // headers on (pomocne w debug)
+  sendAT("ATSP0", 300); // auto protocol (lub ATSP6 dla CAN 11-bit 500k)
+  // opcjonalnie: szybki tryb CAN
+  // sendAT("ATCAF0", 200); // CAN auto formatting off (czasem pomaga)
+
+  // Test — dostępne PID-y
+  elmWrite("0100");
+  String line; elmReadLine(line, 600);
+
+  return true;
+}
+
+void drawAll() {
+  if (currentPage == PAGE_MAIN) drawMainPage();
+  else drawExtraPage();
+}
+
+void setup() {
+  // Serial debug opcjonalnie
+  Serial.begin(115200);
+  delay(200);
+
+  // SPI i wyświetlacz
+  // Jeśli używasz HSPI: SPI.begin(SPI_SCLK, SPI_MISO, SPI_MOSI);
+  tft.begin();
+  tft.setRotation(1); // poziomo
+  tft.fillScreen(ILI9341_BLACK);
+
+  // Dotyk
+  ts.begin();
+  ts.setRotation(1);
+
+  tftHeader("ELM327 — Connecting...");
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 40);
+  tft.print("BT: "); tft.print(ELM_BT_NAME);
+
+  if (!elmInit()) {
+    tft.setCursor(10, 70);
+    tft.setTextColor(ILI9341_RED);
+    tft.print("Nie polaczono z ELM!");
+  } else {
+    tft.setCursor(10, 70);
+    tft.setTextColor(ILI9341_GREEN);
+    tft.print("Polaczono.");
+  }
+
+  delay(500);
+  drawAll();
+}
+
+void loop() {
+  uint32_t now = millis();
+
+  // Szybkie PID-y
+  if (now - tFast >= POLL_FAST_MS && SerialBT.connected()) {
+    tFast = now;
+    updateFastPIDs();
+    if (currentPage == PAGE_MAIN) drawMainPage();
+  }
+
+  // Wolniejsze PID-y
+  if (now - tSlow >= POLL_SLOW_MS && SerialBT.connected()) {
+    tSlow = now;
+    updateSlowPIDs();
+    if (currentPage == PAGE_EXTRA) drawExtraPage();
+  }
+
+  // Obsługa dotyku — przełącznik stron
+  if (ts.touched()) {
+    if (currentPage == PAGE_MAIN) {
+      if (touchHit(10, 220, 90, 20)) { currentPage = PAGE_EXTRA; drawAll(); delay(250); }
+    } else {
+      if (touchHit(10, 220, 110, 20)) { currentPage = PAGE_MAIN; drawAll(); delay(250); }
+    }
+  }
+
+  // Utrata połączenia — spróbuj ponownie
+  static uint32_t tReconnect = 0;
+  if (!SerialBT.connected() && (now - tReconnect > 2000)) {
+    tReconnect = now;
+    SerialBT.connect(ELM_BT_NAME);
+  }
+}
+
+/*
+==================== DODATKI / CUSTOM PID (BMW) ====================
+Przykład zapytania o PID producenta (Mode 22):
+
+1) Wyślij: 22 1234  (gdzie 0x1234 to identyfikator danych)
+2) Odpowiedź: 62 12 34 AA BB ...
+
+W ELM327:
+  - elmWrite("221234");
+  - sparsuj linię zaczynającą się od "62 12 34" i zinterpretuj bajty.
+
+Uwaga: potrzebne są prawidłowe ID oraz interpretacje bajtów dla konkretnego ECU.
+====================================================================
+*/
